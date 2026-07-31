@@ -7,4 +7,4 @@ vaderSentiment
 discord.py
 python-dotenv
 Werkzeug
-twifork
+git+https://github.com/PawiX25/twifork.git
