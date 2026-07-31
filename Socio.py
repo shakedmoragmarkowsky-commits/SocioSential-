@@ -7,7 +7,7 @@ Discord webhook/bot forwarding utilities.
 from flask import Flask, render_template, jsonify, redirect, url_for, session, request
 import base64
 import asyncio
-from twscrape import API, gather
+from twikit import Client
 import json
 import logging
 import os
