@@ -765,35 +765,71 @@ def calculate_threat_tier(score):
 
 
 @app.route("/api/twitter/analyze")
-
 def twitter_analyze():
-    username = request.args.get("username")
+    username = (request.args.get("username") or "").strip().lstrip("@")
     if not username:
         return jsonify({"error": "Username is required"}), 400
-    username = username.strip().lstrip("@")
+
+    async def fetch_x_user():
+        x_username = os.environ.get("X_USERNAME", "").strip()
+        x_email = os.environ.get("X_EMAIL", "").strip()
+        x_password = os.environ.get("X_PASSWORD", "")
+        if not x_username or not x_email or not x_password:
+            raise RuntimeError("Missing X_USERNAME, X_EMAIL or X_PASSWORD in Render Environment")
+
+        client = Client("en-US")
+        await client.login(
+            auth_info_1=x_username,
+            auth_info_2=x_email,
+            password=x_password,
+        )
+
+        user = await client.get_user_by_screen_name(username)
+        tweets_result = await client.get_user_tweets(user.id, "Tweets", count=40)
+
+        profile = {
+            "id": str(getattr(user, "id", "")),
+            "name": getattr(user, "name", "") or "",
+            "username": getattr(user, "screen_name", username) or username,
+            "description": getattr(user, "description", "") or "",
+            "location": getattr(user, "location", "") or "",
+            "profile_image_url": getattr(user, "profile_image_url", "") or "",
+            "verified": bool(getattr(user, "verified", False)),
+            "protected": bool(getattr(user, "protected", False)),
+            "created_at": str(getattr(user, "created_at", "") or ""),
+            "public_metrics": {
+                "followers_count": int(getattr(user, "followers_count", 0) or 0),
+                "following_count": int(getattr(user, "following_count", 0) or 0),
+                "tweet_count": int(getattr(user, "statuses_count", 0) or 0),
+                "listed_count": int(getattr(user, "listed_count", 0) or 0),
+            },
+        }
+
+        tweets = []
+        for tweet in list(tweets_result)[:40]:
+            tweets.append({
+                "id": str(getattr(tweet, "id", "")),
+                "text": getattr(tweet, "text", "") or "",
+                "created_at": str(getattr(tweet, "created_at", "") or ""),
+                "public_metrics": {
+                    "retweet_count": int(getattr(tweet, "retweet_count", 0) or 0),
+                    "reply_count": int(getattr(tweet, "reply_count", 0) or 0),
+                    "like_count": int(getattr(tweet, "favorite_count", 0) or 0),
+                    "quote_count": int(getattr(tweet, "quote_count", 0) or 0),
+                },
+            })
+        return profile, tweets
+
     try:
-        u_url = f"https://api.twitter.com/2/users/by/username/{username}?user.fields=created_at,description,location,name,pinned_tweet_id,profile_image_url,protected,public_metrics,url,username,verified"
-        u_resp = requests.get(u_url, headers=get_twitter_bearer_headers(), timeout=15)
-        if u_resp.status_code != 200:
-            return jsonify({"error": f"Twitter API Error: {u_resp.status_code} - {u_resp.text}"}), u_resp.status_code
-        user_data = u_resp.json().get("data")
-        if not user_data:
-            return jsonify({"error": "User not found"}), 404
-        user_id = user_data["id"]
-        t_url = f"https://api.twitter.com/2/users/{user_id}/tweets"
-        t_resp = requests.get(t_url, headers=get_twitter_bearer_headers(), params={"max_results": 100, "tweet.fields": "created_at,public_metrics,entities,context_annotations,geo", "expansions": "geo.place_id"}, timeout=15)
-        if t_resp.status_code != 200:
-            return jsonify({"error": f"Twitter API Error (Tweets): {t_resp.status_code} - {t_resp.text}"}), t_resp.status_code
-        tweets_data = t_resp.json().get("data", [])
+        user_data, tweets_data = asyncio.run(fetch_x_user())
         data_dir = os.path.join(app.root_path, "data")
         os.makedirs(data_dir, exist_ok=True)
-        with open(os.path.join(data_dir, f"twitter_data_{username}.json"), "w") as f:
-            json.dump({"username": username, "profile": user_data, "tweets": tweets_data}, f, indent=2)
+        with open(os.path.join(data_dir, f"twitter_data_{username}.json"), "w", encoding="utf-8") as f:
+            json.dump({"username": username, "profile": user_data, "tweets": tweets_data}, f, ensure_ascii=False, indent=2)
         return jsonify({"status": "success", "data": user_data, "tweets": tweets_data})
     except Exception as e:
-        logger.exception("Twitter OSINT Error")
-        return jsonify({"error": str(e)}), 500
-
+        logger.exception("Twikit X Error")
+        return jsonify({"error": f"X connection failed: {e}"}), 500
 
 @app.route("/api/twitter/logout")
 def twitter_logout():
