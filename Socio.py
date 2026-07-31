@@ -7,7 +7,9 @@ Discord webhook/bot forwarding utilities.
 from flask import Flask, render_template, jsonify, redirect, url_for, session, request
 import base64
 import asyncio
-from twikit import Client
+from maigret import search as maigret_search
+from maigret.sites import MaigretDatabase
+import maigret as maigret_package
 import json
 import logging
 import os
@@ -766,70 +768,104 @@ def calculate_threat_tier(score):
 
 @app.route("/api/twitter/analyze")
 def twitter_analyze():
+    """Search public profiles across social networks with Maigret.
+
+    No X/Twitter login, API key, password, or cookies are required.
+    The existing endpoint name is kept so the current frontend continues to work.
+    """
     username = (request.args.get("username") or "").strip().lstrip("@")
     if not username:
         return jsonify({"error": "Username is required"}), 400
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", username):
+        return jsonify({"error": "Use a username only (letters, numbers, dot, dash or underscore)"}), 400
 
-    async def fetch_x_user():
-        x_username = os.environ.get("X_USERNAME", "").strip()
-        x_email = os.environ.get("X_EMAIL", "").strip()
-        x_password = os.environ.get("X_PASSWORD", "")
-        if not x_username or not x_email or not x_password:
-            raise RuntimeError("Missing X_USERNAME, X_EMAIL or X_PASSWORD in Render Environment")
+    try:
+        package_dir = os.path.dirname(maigret_package.__file__)
+        database_path = os.path.join(package_dir, "resources", "data.json")
+        database = MaigretDatabase().load_from_path(database_path)
 
-        client = Client("en-US")
-        await client.login(
-            auth_info_1=x_username,
-            auth_info_2=x_email,
-            password=x_password,
+        # Top sites keeps searches practical on Render while covering major networks.
+        top_sites = int(os.environ.get("MAIGRET_TOP_SITES", "300"))
+        top_sites = max(25, min(top_sites, 1000))
+        sites = database.ranked_sites_dict(
+            top=top_sites,
+            excluded_tags=["nsfw", "dating"],
         )
 
-        user = await client.get_user_by_screen_name(username)
-        tweets_result = await client.get_user_tweets(user.id, "Tweets", count=40)
+        raw_results = asyncio.run(
+            maigret_search(
+                username=username,
+                site_dict=sites,
+                logger=logging.getLogger("maigret"),
+                timeout=12,
+                is_parsing_enabled=True,
+                max_connections=50,
+                no_progressbar=True,
+                retries=0,
+            )
+        )
 
-        profile = {
-            "id": str(getattr(user, "id", "")),
-            "name": getattr(user, "name", "") or "",
-            "username": getattr(user, "screen_name", username) or username,
-            "description": getattr(user, "description", "") or "",
-            "location": getattr(user, "location", "") or "",
-            "profile_image_url": getattr(user, "profile_image_url", "") or "",
-            "verified": bool(getattr(user, "verified", False)),
-            "protected": bool(getattr(user, "protected", False)),
-            "created_at": str(getattr(user, "created_at", "") or ""),
+        profiles = []
+        for site_name, result in raw_results.items():
+            status = result.get("status")
+            if not status or not status.is_found():
+                continue
+            profiles.append({
+                "site": site_name,
+                "username": username,
+                "url": result.get("url_user", ""),
+                "http_status": result.get("http_status"),
+                "rank": result.get("rank"),
+                "ids_data": result.get("ids_data") or {},
+            })
+
+        profiles.sort(key=lambda item: (item.get("rank") is None, item.get("rank") or 999999))
+        x_match = next((p for p in profiles if p["site"].lower() in {"twitter", "x"}), None)
+        primary_url = x_match["url"] if x_match else (profiles[0]["url"] if profiles else "")
+
+        profile_summary = {
+            "id": username,
+            "name": username,
+            "username": username,
+            "description": f"Maigret found {len(profiles)} public profile matches across {top_sites} checked sites.",
+            "location": "",
+            "profile_image_url": "",
+            "verified": False,
+            "protected": False,
+            "created_at": "",
+            "url": primary_url,
             "public_metrics": {
-                "followers_count": int(getattr(user, "followers_count", 0) or 0),
-                "following_count": int(getattr(user, "following_count", 0) or 0),
-                "tweet_count": int(getattr(user, "statuses_count", 0) or 0),
-                "listed_count": int(getattr(user, "listed_count", 0) or 0),
+                "followers_count": 0,
+                "following_count": 0,
+                "tweet_count": 0,
+                "listed_count": len(profiles),
             },
         }
 
-        tweets = []
-        for tweet in list(tweets_result)[:40]:
-            tweets.append({
-                "id": str(getattr(tweet, "id", "")),
-                "text": getattr(tweet, "text", "") or "",
-                "created_at": str(getattr(tweet, "created_at", "") or ""),
-                "public_metrics": {
-                    "retweet_count": int(getattr(tweet, "retweet_count", 0) or 0),
-                    "reply_count": int(getattr(tweet, "reply_count", 0) or 0),
-                    "like_count": int(getattr(tweet, "favorite_count", 0) or 0),
-                    "quote_count": int(getattr(tweet, "quote_count", 0) or 0),
-                },
-            })
-        return profile, tweets
-
-    try:
-        user_data, tweets_data = asyncio.run(fetch_x_user())
         data_dir = os.path.join(app.root_path, "data")
         os.makedirs(data_dir, exist_ok=True)
+        report = {
+            "username": username,
+            "profile": profile_summary,
+            "profiles": profiles,
+            "tweets": [],
+            "engine": "maigret",
+        }
         with open(os.path.join(data_dir, f"twitter_data_{username}.json"), "w", encoding="utf-8") as f:
-            json.dump({"username": username, "profile": user_data, "tweets": tweets_data}, f, ensure_ascii=False, indent=2)
-        return jsonify({"status": "success", "data": user_data, "tweets": tweets_data})
+            json.dump(report, f, ensure_ascii=False, indent=2, default=str)
+
+        return jsonify({
+            "status": "success",
+            "engine": "maigret",
+            "data": profile_summary,
+            "profiles": profiles,
+            "tweets": [],
+            "found_count": len(profiles),
+            "checked_count": len(sites),
+        })
     except Exception as e:
-        logger.exception("Twikit X Error")
-        return jsonify({"error": f"X connection failed: {e}"}), 500
+        logger.exception("Maigret search error")
+        return jsonify({"error": f"Maigret search failed: {e}"}), 500
 
 @app.route("/api/twitter/logout")
 def twitter_logout():
