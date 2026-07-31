@@ -7,4 +7,4 @@ vaderSentiment
 discord.py
 python-dotenv
 Werkzeug
-twscrape
+twikit==2.3.3
