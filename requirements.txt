@@ -1,6 +1,4 @@
 Flask>=3.0,<4
 gunicorn>=22,<24
 requests>=2.32,<3
-maigret>=0.6.3,<0.7
 dnspython>=2.6,<3
-socialscan>=1.4,<2
