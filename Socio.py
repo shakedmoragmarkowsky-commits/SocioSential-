@@ -35,10 +35,10 @@ a{color:#51e8bd}.badge{display:inline-block;padding:3px 7px;border:1px solid #2a
 </style></head><body><main>
 <div class="brand">SOCIOSENTIAL OSINT</div><div class="sub">Public-source discovery. No X login, cookies, or API keys required.</div>
 <div class="panel"><div class="row">
-<select id="type"><option value="auto">Auto detect</option><option value="username">Username</option><option value="email">Email</option><option value="name">Full name</option><option value="domain">Domain</option><option value="url">URL</option></select>
-<input id="query" placeholder="username, email, name, domain or URL" autocomplete="off">
+<select id="type"><option value="auto">Auto detect</option><option value="username">Username</option><option value="email">Email</option><option value="name">Full name</option><option value="domain">Domain</option><option value="url">URL</option><option value="thailand">Thailand public sources</option></select>
+<input id="query" placeholder="one or more usernames, email, name, domain or URL" autocomplete="off">
 <button id="go">SEARCH</button></div>
-<div class="small" style="margin-top:10px">Only public data and availability signals are checked. Results are leads, not identity proof.</div><div id="status"></div></div>
+<div class="small" style="margin-top:10px">Only public data is checked. Dating services are listed as manual/public pivots only; private profiles are not queried.</div><div id="status"></div></div>
 <div id="results"></div>
 <script>
 const q=s=>document.querySelector(s);const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -132,6 +132,52 @@ def search_username(username: str):
         "warnings": ["Some sites may block cloud-hosted scanners. Missing results do not prove an account does not exist."],
     }
 
+
+
+def thailand_public_links(query: str):
+    q = query.strip().lstrip("@")
+    encoded = quote_plus(q)
+    # Public/indexed sources popular or active in Thailand. These are search pivots,
+    # not proof that a person owns an account.
+    return [
+        {"name": "Facebook public pages/profiles", "url": f"https://www.google.com/search?q=site%3Afacebook.com+%22{encoded}%22"},
+        {"name": "Instagram public profiles", "url": f"https://www.google.com/search?q=site%3Ainstagram.com+%22{encoded}%22"},
+        {"name": "TikTok public profiles", "url": f"https://www.google.com/search?q=site%3Atiktok.com+%22{encoded}%22"},
+        {"name": "YouTube channels", "url": f"https://www.google.com/search?q=site%3Ayoutube.com+%22{encoded}%22"},
+        {"name": "Threads public profiles", "url": f"https://www.google.com/search?q=site%3Athreads.net+%22{encoded}%22"},
+        {"name": "X public profiles/posts", "url": f"https://www.google.com/search?q=site%3Ax.com+%22{encoded}%22"},
+        {"name": "Pantip discussions", "url": f"https://www.google.com/search?q=site%3Apantip.com+%22{encoded}%22"},
+        {"name": "Thailand-247 forum", "url": f"https://www.google.com/search?q=site%3Athailand-247.com+%22{encoded}%22"},
+        {"name": "Thaiger Talk forum", "url": f"https://www.google.com/search?q=site%3Athethaiger.com%2Ftalk+%22{encoded}%22"},
+        {"name": "ThaiFriendly public-index check", "url": f"https://www.google.com/search?q=site%3Athaifriendly.com+%22{encoded}%22"},
+        {"name": "Tinder Thailand (manual)", "url": "https://tinder.com/?lang=th"},
+        {"name": "Bumble Thailand (manual)", "url": "https://bumble.com/"},
+        {"name": "ThaiFriendly (manual)", "url": "https://www.thaifriendly.com/"},
+    ]
+
+
+def search_thailand(query: str):
+    values = [x.strip().lstrip("@") for x in re.split(r"[\n,;]+|\s{2,}", query) if x.strip()]
+    if not values:
+        raise ValueError("Enter a username, name, or phrase.")
+    if len(values) > 10:
+        raise ValueError("Use up to 10 searches at a time.")
+    links=[]
+    for value in values:
+        for item in thailand_public_links(value):
+            links.append({"name": f"{value} — {item['name']}", "url": item["url"]})
+    return {
+        "type": "thailand",
+        "query": query,
+        "summary": f"Created public-source pivots for {len(values)} query item(s) across Thailand-relevant social networks, public forums, and manual dating-service checks.",
+        "results": [],
+        "search_links": links,
+        "warnings": [
+            "Dating services generally do not provide reliable public username search. Manual links are included only for authorized checks.",
+            "No private profiles, login-only data, adult-interest profiling, or anti-bot bypass is performed.",
+            "Matching text is a lead, not identity proof."
+        ],
+    }
 
 def search_email(email: str):
     email = email.strip().lower()
@@ -269,6 +315,8 @@ def api_search():
             data = search_domain(query)
         elif kind == "url":
             data = search_url(query)
+        elif kind == "thailand":
+            data = search_thailand(query)
         else:
             return jsonify({"error": "Unsupported search type."}), 400
         return jsonify(data)
