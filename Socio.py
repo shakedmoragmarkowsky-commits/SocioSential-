@@ -26,11 +26,13 @@ app.config["MAX_CONTENT_LENGTH"] = 48 * 1024
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sociosential")
 
-VERSION = "4.0.0-evidence"
+VERSION = "6.0.0-evidence-graph"
 MAX_ITEMS = 15
 HTTP_TIMEOUT = 7
 SHERLOCK_TIMEOUT = 55
-MAX_SHERLOCK_VERIFY = 24
+MAX_SHERLOCK_VERIFY = 30
+MAX_WMN_CHECKS = 80
+MAX_PIVOTS = 10
 RATE_WINDOW = 60
 RATE_LIMIT = 10
 JOB_TTL = 30 * 60
@@ -42,7 +44,7 @@ DOMAIN_RE = re.compile(r"^(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.
 
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (compatible; SocioSential/4.0; public-source research)",
+    "User-Agent": "Mozilla/5.0 (compatible; SocioSential/6.0; public-source research)",
     "Accept-Language": "en-US,en;q=0.8,th;q=0.7",
 })
 
@@ -53,6 +55,18 @@ _jobs: dict[str, dict[str, Any]] = {}
 _cache_lock = threading.Lock()
 _cache: dict[str, tuple[float, Any]] = {}
 CACHE_TTL = 15 * 60
+_WMN_CACHE: tuple[float, list[dict[str, Any]]] | None = None
+WMN_URLS = [
+    "https://raw.githubusercontent.com/Arcade-Project/WhatsMyName/main/wmn-data.json",
+    "https://raw.githubusercontent.com/WebBreacher/WhatsMyName/main/wmn-data.json",
+]
+SOCIAL_HOSTS = {
+    "github.com", "gitlab.com", "reddit.com", "www.reddit.com", "keybase.io",
+    "dev.to", "chess.com", "www.chess.com", "t.me", "codeberg.org",
+    "hub.docker.com", "scratch.mit.edu", "medium.com", "www.pinterest.com",
+    "pinterest.com", "www.tiktok.com", "tiktok.com", "www.instagram.com",
+    "instagram.com", "x.com", "www.facebook.com", "facebook.com",
+}
 
 
 @dataclass
@@ -336,6 +350,106 @@ def run_sherlock(username: str) -> list[tuple[str, str]]:
     return []
 
 
+def _wmn_sites() -> list[dict[str, Any]]:
+    """Load WhatsMyName's public site definition database with a short in-memory cache."""
+    global _WMN_CACHE
+    now = time.time()
+    if _WMN_CACHE and now - _WMN_CACHE[0] < 6 * 60 * 60:
+        return _WMN_CACHE[1]
+    for url in WMN_URLS:
+        try:
+            r = get(url)
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            sites = data.get("sites") if isinstance(data, dict) else data
+            if isinstance(sites, list) and sites:
+                _WMN_CACHE = (now, sites)
+                return sites
+        except Exception as exc:
+            logger.info("WhatsMyName database unavailable: %s", type(exc).__name__)
+    return []
+
+
+def _wmn_site_url(site: dict[str, Any], username: str) -> str:
+    template = str(site.get("uri_check") or site.get("uri") or site.get("url") or "")
+    for token in ("{account}", "{username}", "{}"):
+        template = template.replace(token, quote(username))
+    return template
+
+
+def _wmn_match(site: dict[str, Any], response: requests.Response) -> bool:
+    text = response.text[:250000]
+    status = response.status_code
+    expected_code = site.get("e_code")
+    missing_code = site.get("m_code")
+    expected = str(site.get("e_string") or "")
+    missing = str(site.get("m_string") or "")
+    if missing_code not in (None, "") and status == int(missing_code):
+        return False
+    if missing and missing in text:
+        return False
+    if expected_code not in (None, "") and status != int(expected_code):
+        return False
+    if expected and expected not in text:
+        return False
+    return status < 400 and bool(expected or expected_code not in (None, ""))
+
+
+def run_whatsmyname(username: str) -> list[tuple[str, str]]:
+    sites = _wmn_sites()[:MAX_WMN_CHECKS]
+    if not sites:
+        return []
+    def check(site: dict[str, Any]) -> tuple[str, str] | None:
+        url = _wmn_site_url(site, username)
+        if not url.startswith(("http://", "https://")):
+            return None
+        try:
+            r = get(url)
+            if _wmn_match(site, r):
+                return str(site.get("name") or site.get("site") or "WhatsMyName"), r.url
+        except Exception:
+            return None
+        return None
+    found=[]
+    seen=set()
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        futures=[pool.submit(check, site) for site in sites]
+        for future in as_completed(futures):
+            item=future.result()
+            if item and item[1] not in seen:
+                seen.add(item[1]); found.append(item)
+    return found
+
+
+def extract_public_pivots(findings: list[Finding], original_username: str) -> list[tuple[str, str, str]]:
+    """Extract a small number of public cross-profile links from confirmed pages."""
+    pivots=[]
+    seen=set()
+    href_re=re.compile(r'href=["\'](https?://[^"\']+)', re.I)
+    for finding in findings:
+        if not finding.url or finding.level not in {"verified", "strong_possible"}:
+            continue
+        try:
+            r=get(finding.url)
+            if r.status_code != 200 or "text/html" not in r.headers.get("content-type", "").lower():
+                continue
+            for href in href_re.findall(r.text[:350000]):
+                parsed=urlparse(href)
+                host=(parsed.hostname or "").lower()
+                if host not in SOCIAL_HOSTS or href in seen:
+                    continue
+                parts=[x for x in parsed.path.split("/") if x]
+                candidate=(parts[-1] if parts else "").lstrip("@").strip()
+                if candidate and USERNAME_RE.fullmatch(candidate) and candidate.casefold()!=original_username.casefold():
+                    seen.add(href); pivots.append((finding.source, href, candidate))
+                    if len(pivots)>=MAX_PIVOTS:
+                        return pivots
+        except requests.RequestException:
+            continue
+    return pivots
+
+
 BLOCK_MARKERS = [
     "cloudflare", "captcha", "access denied", "403 forbidden", "bot protection",
     "sign in to continue", "login required", "page not found", "not found",
@@ -368,21 +482,35 @@ def verify_discovery_page(source: str, url: str, username: str) -> Finding | Non
     return None
 
 
-def verify_sherlock_hits(username: str, direct_urls: set[str]) -> list[Finding]:
-    hits = run_sherlock(username)
-    candidates = [(s, u) for s, u in hits if u not in direct_urls]
+def verify_candidate_hits(username: str, direct_urls: set[str]) -> list[Finding]:
+    engine_hits: list[tuple[str, str, str]] = []
+    for source, url in run_sherlock(username):
+        engine_hits.append(("Sherlock", source, url))
+    for source, url in run_whatsmyname(username):
+        engine_hits.append(("WhatsMyName", source, url))
+    unique: dict[str, tuple[str, str]] = {}
+    for engine, source, url in engine_hits:
+        if url not in direct_urls and url not in unique:
+            unique[url] = (engine, source)
+    candidates=list(unique.items())[:MAX_SHERLOCK_VERIFY + MAX_WMN_CHECKS]
     results: list[Finding] = []
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = {pool.submit(verify_discovery_page, s, u, username): (s, u) for s, u in candidates}
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        futures={pool.submit(verify_discovery_page, source, url, username):(engine,source,url) for url,(engine,source) in candidates}
         for future in as_completed(futures):
+            engine, source, url=futures[future]
             try:
-                item = future.result()
+                item=future.result()
                 if item:
+                    item.details = {**(item.details or {}), "discovery_engine": engine}
                     results.append(item)
+                else:
+                    results.append(Finding(source, "possible", f"{engine} candidate requires manual review", url, f"{engine} reported this public account URL, but independent page verification was blocked or inconclusive.", 28, {"discovery_engine": engine}))
             except Exception:
                 continue
-    return sorted(results, key=lambda x: (0 if x.level == "strong_possible" else 1, x.source.casefold()))
-
+    dedup={}
+    for item in results:
+        dedup[item.url or (item.source+item.title)] = item
+    return sorted(dedup.values(), key=lambda x:(0 if x.level=="strong_possible" else 1, -(x.score or 0), x.source.casefold()))
 
 def cross_source_summary(username: str, verified: list[Finding], strong: list[Finding]) -> Finding | None:
     if len(verified) >= 2:
@@ -396,26 +524,33 @@ def search_username(username: str, progress: Callable[[str], None] | None = None
     username = username.strip().lstrip("@")
     if not USERNAME_RE.fullmatch(username):
         raise ValueError(f"Invalid username: {username}")
-    key = "username:" + username.casefold()
+    key = "username-v6:" + username.casefold()
     cached = _cache_get(key)
     if cached is not None:
         return [Finding(**x) for x in cached]
     if progress:
-        progress(f"Checking direct public APIs for @{username}")
+        progress(f"Direct API checks for @{username}")
     verified = run_direct_adapters(username)
-    if progress:
-        progress(f"Running discovery and page verification for @{username}")
     direct_urls = {x.url for x in verified if x.url}
-    sherlock = verify_sherlock_hits(username, direct_urls)
+    if progress:
+        progress(f"Sherlock + WhatsMyName discovery for @{username}")
+    candidates = verify_candidate_hits(username, direct_urls)
     telegram = telegram_possible(username)
     if telegram and telegram.url not in direct_urls:
-        sherlock.append(telegram)
-    strong = [x for x in sherlock if x.level == "strong_possible"]
+        candidates.append(telegram)
+    strong = [x for x in candidates if x.level == "strong_possible"]
     summary = cross_source_summary(username, verified, strong)
-    findings = verified + ([summary] if summary else []) + sherlock
+    findings = verified + ([summary] if summary else []) + candidates
+    if progress:
+        progress(f"Second-hop public pivot analysis for @{username}")
+    for parent, url, discovered in extract_public_pivots(verified + strong, username):
+        findings.append(Finding("Evidence graph", "info", f"Public linked handle discovered: @{discovered}", url, f"A public link from {parent} points to another social profile. This is a pivot lead, not proof of common ownership.", 55, {"parent_source": parent, "discovered_username": discovered}))
+    dedup={}
+    for item in findings:
+        dedup[(item.url or item.source+item.title, item.level)] = item
+    findings=list(dedup.values())
     _cache_set(key, [x.to_dict() for x in findings])
     return findings
-
 
 def domain_lookup(domain: str) -> dict[str, list[str]]:
     import dns.resolver
@@ -506,16 +641,16 @@ def perform_item(value: str, requested_type: str, progress: Callable[[str], None
         findings = search_url(value)
     elif kind == "phone":
         query_value = normalize_phone(value)
-        findings = []
+        findings = [Finding("Phone search", "info", "No reliable free direct lookup is enabled", "", "Phone-number identity lookup cannot be verified reliably from free public endpoints. No search-engine links are shown as results.", 0)]
     elif kind in {"name", "thailand"}:
-        findings = []
+        findings = [Finding("Name search", "info", "No reliable free direct lookup is enabled", "", "A name alone is too ambiguous for automatic verification. No search-engine links are shown as results. Use known usernames for real account checks.", 0)]
     else:
         raise ValueError(f"Unsupported search type: {kind}")
 
     levels = {"verified": [], "strong_possible": [], "possible": [], "manual": [], "info": []}
     for item in findings:
         levels.setdefault(item.level, []).append(item.to_dict())
-    levels["manual"] = [r.to_dict() for r in manual_pivots(query_value, kind)]
+    levels["manual"] = [r.to_dict() for r in manual_pivots(query_value, kind)] if os.getenv("SHOW_MANUAL_LINKS", "0") == "1" else []
     counts = {k: len(v) for k, v in levels.items()}
     return {"query": query_value, "type": kind, "counts": counts, **levels}
 
@@ -558,11 +693,11 @@ HTML = r'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name
 :root{--bg:#06110e;--panel:#091713;--line:#21d8a6;--text:#ddfff6;--muted:#7fa99d;--red:#ff6969;--yellow:#f7c967;--blue:#83b8ff;--violet:#c19cff}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:ui-monospace,SFMono-Regular,Menlo,monospace}main{max-width:1050px;margin:auto;padding:22px}.brand{letter-spacing:.22em;color:var(--line);font-size:22px}.sub{color:var(--muted);line-height:1.5;margin:10px 0 22px}.panel{border:1px solid #17614f;background:var(--panel);padding:17px;margin:15px 0}select,textarea,button{width:100%;padding:14px;border:1px solid #2a715e;background:#06110e;color:var(--text);font:inherit}textarea{min-height:125px;resize:vertical}button{border-color:#b74242;color:#ff9999;margin-top:10px}.status{border-left:4px solid var(--line);padding:12px;margin-top:12px}.error{border-color:var(--red);color:#ffc0c0}.bar{height:8px;background:#15352d;margin-top:8px}.bar>div{height:100%;background:var(--line);width:0}.item{border:1px solid #1d604f;padding:14px;margin:15px 0}.summary{color:var(--muted);margin-bottom:12px}.card{border:1px solid #285f52;padding:12px;margin:9px 0;overflow-wrap:anywhere}.verified{border-color:var(--line)}.strong_possible{border-color:var(--violet)}.possible{border-color:var(--yellow)}.manual{border-color:var(--blue)}.info{border-color:#7ea89c}.badge{display:inline-block;padding:3px 7px;margin-right:8px;border:1px solid currentColor}.verified .badge{color:var(--line)}.strong_possible .badge{color:var(--violet)}.possible .badge{color:var(--yellow)}.manual .badge{color:var(--blue)}.info .badge{color:#aacbc1}a{color:#5ce6bf}.small{color:var(--muted);font-size:12px;line-height:1.45}.score{float:right}.privacy{font-size:12px;color:var(--muted);margin-top:8px}.actions{display:flex;gap:10px}.actions button{width:auto;flex:1}@media(max-width:650px){.brand{font-size:18px}.actions{display:block}}
 </style></head><body><main>
-<div class="brand">SOCIOSENTIAL EVIDENCE OSINT</div>
-<div class="sub">Direct APIs first. Sherlock is discovery only, then every returned page is checked again. Search links never count as findings.</div>
+<div class="brand">SOCIOSENTIAL EVIDENCE GRAPH</div>
+<div class="sub">Multi-engine public-source discovery: direct APIs, Sherlock, WhatsMyName, strict page verification, and limited second-hop pivots. Search links never count as findings.</div>
 <div class="panel"><select id="type"><option value="auto">Auto detect</option><option value="username">Username</option><option value="email">Email</option><option value="name">Full name</option><option value="phone">Phone</option><option value="domain">Domain</option><option value="url">URL</option><option value="thailand">Thailand public sources</option></select>
 <textarea id="query" placeholder="Up to 15 values. Separate with a new line, comma, semicolon, or *"></textarea><button id="go">SEARCH</button>
-<div class="privacy">No search history is intentionally persisted by the application. Public sources only. Verified means account existence from a direct public endpoint—not proof of real-world ownership.</div><div id="status"></div></div><div id="results"></div>
+<div class="privacy">No search history is intentionally persisted by the application. Public sources only. Verified means an exact account exists on that service—not proof that multiple accounts belong to the same person.</div><div id="status"></div></div><div id="results"></div>
 <script>
 const $=s=>document.querySelector(s);const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));let lastData=null;
 function card(r,level){return `<div class="card ${level}"><span class="badge">${level.replace('_',' ').toUpperCase()}</span><b>${esc(r.source)} — ${esc(r.title)}</b>${r.score!=null?`<span class="score">${esc(r.score)}%</span>`:''}${r.url?`<div><a target="_blank" rel="noopener noreferrer" href="${esc(r.url)}">Open</a></div>`:''}${r.evidence?`<div class="small">${esc(r.evidence)}</div>`:''}${r.details?`<pre class="small">${esc(JSON.stringify(r.details,null,2))}</pre>`:''}</div>`}
@@ -594,7 +729,7 @@ def index() -> str:
 
 @app.get("/health")
 def health() -> Response:
-    return jsonify({"status": "ok", "version": VERSION, "sherlock_enabled": os.getenv("ENABLE_SHERLOCK", "1") == "1"})
+    return jsonify({"status": "ok", "version": VERSION, "sherlock_enabled": os.getenv("ENABLE_SHERLOCK", "1") == "1", "whatsmyname_enabled": True, "mode": "evidence-graph"})
 
 
 @app.post("/api/jobs")
