@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: sociosential
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 180 Socio:app
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: ENABLE_SHERLOCK
+        value: "1"
+      - key: SHOW_MANUAL_LINKS
+        value: "0"
