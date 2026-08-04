@@ -1,5 +1,11 @@
 Flask>=3.0,<4
-gunicorn>=22,<24
 requests>=2.32,<3
-dnspython>=2.6,<3
-sherlock-project>=0.16,<1
+celery>=5.3,<6
+redis>=5,<7
+textblob>=0.18,<1
+vaderSentiment>=3.3,<4
+discord.py>=2.4,<3
+python-dotenv>=1,<2
+Werkzeug>=3,<4
+twikit==2.3.3
+gunicorn>=22,<24
