@@ -26,16 +26,16 @@ app.config["MAX_CONTENT_LENGTH"] = 48 * 1024
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sociosential")
 
-VERSION = "6.0.0-evidence-graph"
+VERSION = "7.0.0-strict-evidence"
 MAX_ITEMS = 15
 HTTP_TIMEOUT = 7
 SHERLOCK_TIMEOUT = 55
-MAX_SHERLOCK_VERIFY = 30
-MAX_WMN_CHECKS = 80
+MAX_SHERLOCK_VERIFY = 24
+MAX_WMN_CHECKS = 55
 MAX_PIVOTS = 10
 RATE_WINDOW = 60
 RATE_LIMIT = 10
-JOB_TTL = 30 * 60
+JOB_TTL = 12 * 60
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
@@ -44,7 +44,7 @@ DOMAIN_RE = re.compile(r"^(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.
 
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (compatible; SocioSential/6.0; public-source research)",
+    "User-Agent": "Mozilla/5.0 (compatible; SocioSential/7.0; consent-based public-source evidence audit)",
     "Accept-Language": "en-US,en;q=0.8,th;q=0.7",
 })
 
@@ -67,6 +67,26 @@ SOCIAL_HOSTS = {
     "pinterest.com", "www.tiktok.com", "tiktok.com", "www.instagram.com",
     "instagram.com", "x.com", "www.facebook.com", "facebook.com",
 }
+
+THAI_SOURCE_CATALOG = [
+    {"name": "Pantip", "domain": "pantip.com", "category": "community", "audience": "thai-local", "quality": 5},
+    {"name": "Dek-D", "domain": "dek-d.com", "category": "community", "audience": "thai-local", "quality": 4},
+    {"name": "Bloggang", "domain": "bloggang.com", "category": "blogs", "audience": "thai-local", "quality": 4},
+    {"name": "Blockdit", "domain": "blockdit.com", "category": "social-publishing", "audience": "thai-local", "quality": 4},
+    {"name": "Wongnai", "domain": "wongnai.com", "category": "local-business", "audience": "thai-local", "quality": 4},
+    {"name": "Kaidee", "domain": "kaidee.com", "category": "marketplace", "audience": "thai-local", "quality": 3},
+    {"name": "Sanook", "domain": "sanook.com", "category": "portal", "audience": "thai-local", "quality": 3},
+    {"name": "Kapook", "domain": "kapook.com", "category": "portal", "audience": "thai-local", "quality": 3},
+    {"name": "MThai", "domain": "mthai.com", "category": "portal", "audience": "thai-local", "quality": 3},
+    {"name": "Lemon8 Thailand", "domain": "lemon8-app.com", "category": "social", "audience": "thai-local", "quality": 3},
+]
+
+SOURCE_QUALITY = {item["domain"]: item["quality"] for item in THAI_SOURCE_CATALOG}
+SOURCE_QUALITY.update({
+    "github.com": 5, "gitlab.com": 5, "reddit.com": 4, "www.reddit.com": 4,
+    "x.com": 4, "instagram.com": 3, "www.instagram.com": 3,
+    "tiktok.com": 3, "www.tiktok.com": 3, "facebook.com": 3, "www.facebook.com": 3,
+})
 
 
 @dataclass
@@ -155,33 +175,48 @@ def infer_type(value: str) -> str:
 
 
 def exact_search_url(text: str, domain: str | None = None) -> str:
+    """Manual exact-phrase pivot. Never parsed, scored, or treated as evidence."""
     query = f'site:{domain} "{text}"' if domain else f'"{text}"'
-    return "https://www.google.com/search?q=" + quote_plus(query)
+    return "https://www.google.com/search?nfpr=1&q=" + quote_plus(query)
+
+
+def thai_variants(text: str) -> list[str]:
+    """Conservative variants only; no fuzzy correction and no invented transliteration."""
+    value = re.sub(r"\s+", " ", text).strip()
+    variants = [value]
+    replacements = {
+        "Bangkok": ["กรุงเทพ", "กรุงเทพฯ", "กทม."],
+        "Thailand": ["ประเทศไทย", "ไทย"],
+    }
+    for key, alts in replacements.items():
+        if key.casefold() in value.casefold():
+            for alt in alts:
+                candidate = re.sub(re.escape(key), alt, value, flags=re.I)
+                if candidate not in variants:
+                    variants.append(candidate)
+    return variants[:6]
 
 
 def manual_pivots(value: str, kind: str) -> list[Finding]:
-    pivots = [
-        Finding("Google", "manual", "Exact web search", exact_search_url(value), "Search pivot only; never counted as a finding."),
-        Finding("Bing", "manual", "Exact web search", "https://www.bing.com/search?q=" + quote_plus(f'"{value}"'), "Search pivot only; never counted as a finding."),
+    """Optional exact-phrase review links. They are never fetched, scored, or counted as matches."""
+    pivots: list[Finding] = []
+    variants = thai_variants(value) if kind in {"name", "thailand"} else [value]
+    sources = THAI_SOURCE_CATALOG + [
+        {"name": "X", "domain": "x.com", "category": "social", "audience": "global", "quality": 4},
+        {"name": "Facebook public pages", "domain": "facebook.com", "category": "social", "audience": "global", "quality": 3},
+        {"name": "Instagram public pages", "domain": "instagram.com", "category": "social", "audience": "global", "quality": 3},
+        {"name": "TikTok public pages", "domain": "tiktok.com", "category": "social", "audience": "global", "quality": 3},
     ]
-    if kind in {"username", "name", "phone", "email", "thailand"}:
-        sources = [
-            ("Facebook", "facebook.com"), ("Instagram", "instagram.com"),
-            ("TikTok", "tiktok.com"), ("X", "x.com"),
-            ("Threads", "threads.net"), ("YouTube", "youtube.com"),
-            ("Pantip", "pantip.com"), ("ASEAN NOW", "aseannow.com"),
-            ("TeakDoor", "teakdoor.com"), ("Thailand-247", "thailand-247.com"),
-            ("Thaiger Talk", "thethaiger.com/talk"), ("Sanook", "sanook.com"),
-            ("Kapook", "kapook.com"), ("MThai", "mthai.com"),
-        ]
-        for label, domain in sources:
-            pivots.append(Finding(label, "manual", f"Search {label}", exact_search_url(value, domain), "Public indexed pages only; not counted as a match."))
-        pivots.extend([
-            Finding("LINE OpenChat", "manual", "Search public OpenChat", "https://openchat.line.me/th/search?q=" + quote_plus(value), "Public OpenChat only; private LINE accounts are not searchable."),
-            Finding("WeChat public content", "manual", "Search indexed WeChat articles", exact_search_url(value, "mp.weixin.qq.com"), "Public indexed articles only; private WeChat accounts are not searchable."),
-            Finding("Telegram", "manual", "Search public Telegram pages", exact_search_url(value, "t.me"), "Public pages only; attribution requires independent evidence."),
-        ])
-    return pivots
+    for variant in variants:
+        for src in sources:
+            pivots.append(Finding(
+                src["name"], "manual", f'Exact phrase: "{variant}"',
+                exact_search_url(variant, src["domain"]),
+                "Manual review only. Reject the result if the search engine substituted, corrected, translated, or broadened the requested phrase.",
+                None,
+                {"requested_phrase": variant, "domain": src["domain"], "category": src["category"], "audience": src["audience"], "source_quality": src["quality"]},
+            ))
+    return pivots[:80]
 
 
 def get(url: str, **kwargs: Any) -> requests.Response:
@@ -457,6 +492,7 @@ BLOCK_MARKERS = [
 
 
 def verify_discovery_page(source: str, url: str, username: str) -> Finding | None:
+    """Return only independently verified account-existence candidates. One-signal pages are suppressed."""
     try:
         r = get(url)
         if r.status_code != 200:
@@ -469,20 +505,28 @@ def verify_discovery_page(source: str, url: str, username: str) -> Finding | Non
         if any(marker in low for marker in BLOCK_MARKERS):
             return None
         parsed = urlparse(r.url)
-        path_signal = username.casefold() in parsed.path.casefold()
-        content_signal = re.search(rf"(?<![A-Za-z0-9._-]){re.escape(username)}(?![A-Za-z0-9._-])", text, re.I) is not None
+        exact = username.casefold()
+        path_parts = [p.casefold().lstrip("@") for p in parsed.path.split("/") if p]
+        path_signal = exact in path_parts
+        content_signal = re.search(rf"(?<![A-Za-z0-9._-])@?{re.escape(username)}(?![A-Za-z0-9._-])", text, re.I) is not None
+        canonical_signal = re.search(r'<link[^>]+rel=["\']canonical["\'][^>]+href=["\'][^"\']*'+re.escape(username), text, re.I) is not None
         title_match = re.search(r"<title[^>]*>(.*?)</title>", text, re.I | re.S)
         title = re.sub(r"\s+", " ", title_match.group(1)).strip()[:180] if title_match else ""
-        if path_signal and content_signal:
-            return Finding(source, "strong_possible", "Public profile page passed two checks", r.url, "The final URL path and page content both contain the exact handle. This is strong evidence of account existence, but not identity ownership.", 76, {"page_title": title})
-        if path_signal or content_signal:
-            return Finding(source, "possible", "Public page contains one exact-handle signal", r.url, "One exact-handle signal was observed. Manual review is required.", 52, {"page_title": title})
+        og_signal = re.search(r'<meta[^>]+(?:property|name)=["\'](?:og:url|twitter:url)["\'][^>]+content=["\'][^"\']*'+re.escape(username), text, re.I) is not None
+        signals = {"exact_path": path_signal, "exact_content": content_signal, "canonical": canonical_signal, "social_meta": og_signal}
+        signal_count = sum(bool(v) for v in signals.values())
+        host = (parsed.hostname or "").lower()
+        quality = SOURCE_QUALITY.get(host, 2)
+        # Discovery tools are only leads. Publication requires an exact path plus two independent page signals.
+        if path_signal and signal_count >= 3:
+            score = min(89, 68 + signal_count * 4 + quality)
+            return Finding(source, "strong_possible", "Public account page passed three-signal verification", r.url, "The final account path and at least two independent page signals contain the exact handle. This supports account existence only; real-world ownership remains unproven.", score, {"page_title": title, "signals": signals, "signal_count": signal_count, "source_quality": quality, "final_host": host})
     except requests.RequestException:
         return None
     return None
 
 
-def verify_candidate_hits(username: str, direct_urls: set[str]) -> list[Finding]:
+def verify_candidate_hits(username: str, direct_urls: set[str]) -> tuple[list[Finding], int]:
     engine_hits: list[tuple[str, str, str]] = []
     for source, url in run_sherlock(username):
         engine_hits.append(("Sherlock", source, url))
@@ -492,25 +536,27 @@ def verify_candidate_hits(username: str, direct_urls: set[str]) -> list[Finding]
     for engine, source, url in engine_hits:
         if url not in direct_urls and url not in unique:
             unique[url] = (engine, source)
-    candidates=list(unique.items())[:MAX_SHERLOCK_VERIFY + MAX_WMN_CHECKS]
+    candidates = list(unique.items())[:MAX_SHERLOCK_VERIFY + MAX_WMN_CHECKS]
     results: list[Finding] = []
+    suppressed = 0
     with ThreadPoolExecutor(max_workers=10) as pool:
-        futures={pool.submit(verify_discovery_page, source, url, username):(engine,source,url) for url,(engine,source) in candidates}
+        futures = {pool.submit(verify_discovery_page, source, url, username): (engine, source, url) for url, (engine, source) in candidates}
         for future in as_completed(futures):
-            engine, source, url=futures[future]
+            engine, source, _url = futures[future]
             try:
-                item=future.result()
+                item = future.result()
                 if item:
                     item.details = {**(item.details or {}), "discovery_engine": engine}
                     results.append(item)
                 else:
-                    results.append(Finding(source, "possible", f"{engine} candidate requires manual review", url, f"{engine} reported this public account URL, but independent page verification was blocked or inconclusive.", 28, {"discovery_engine": engine}))
+                    suppressed += 1
             except Exception:
-                continue
-    dedup={}
+                suppressed += 1
+    dedup: dict[str, Finding] = {}
     for item in results:
-        dedup[item.url or (item.source+item.title)] = item
-    return sorted(dedup.values(), key=lambda x:(0 if x.level=="strong_possible" else 1, -(x.score or 0), x.source.casefold()))
+        dedup[item.url or (item.source + item.title)] = item
+    return sorted(dedup.values(), key=lambda x: (-(x.score or 0), x.source.casefold())), suppressed
+
 
 def cross_source_summary(username: str, verified: list[Finding], strong: list[Finding]) -> Finding | None:
     if len(verified) >= 2:
@@ -524,7 +570,7 @@ def search_username(username: str, progress: Callable[[str], None] | None = None
     username = username.strip().lstrip("@")
     if not USERNAME_RE.fullmatch(username):
         raise ValueError(f"Invalid username: {username}")
-    key = "username-v6:" + username.casefold()
+    key = "username-v7:" + username.casefold()
     cached = _cache_get(key)
     if cached is not None:
         return [Finding(**x) for x in cached]
@@ -534,13 +580,12 @@ def search_username(username: str, progress: Callable[[str], None] | None = None
     direct_urls = {x.url for x in verified if x.url}
     if progress:
         progress(f"Sherlock + WhatsMyName discovery for @{username}")
-    candidates = verify_candidate_hits(username, direct_urls)
-    telegram = telegram_possible(username)
-    if telegram and telegram.url not in direct_urls:
-        candidates.append(telegram)
+    candidates, suppressed = verify_candidate_hits(username, direct_urls)
     strong = [x for x in candidates if x.level == "strong_possible"]
     summary = cross_source_summary(username, verified, strong)
     findings = verified + ([summary] if summary else []) + candidates
+    if suppressed:
+        findings.append(Finding("Quality filter", "info", f"{suppressed} weak candidates suppressed", "", "These URLs were reported by discovery engines but failed independent strict verification, so they are not shown as results.", None, {"suppressed_candidates": suppressed}))
     if progress:
         progress(f"Second-hop public pivot analysis for @{username}")
     for parent, url, discovered in extract_public_pivots(verified + strong, username):
@@ -615,19 +660,19 @@ def search_url(value: str) -> list[Finding]:
         r = SESSION.get(value, timeout=HTTP_TIMEOUT, allow_redirects=True, stream=True)
         ctype = r.headers.get("content-type", "")
         details = {"http_status": r.status_code, "content_type": ctype, "final_url": r.url}
-        level = "verified" if r.status_code < 400 else "possible"
+        level = "verified" if r.status_code < 400 else "info"
         return [Finding("Web page", level, "Direct URL checked", r.url, "A direct HTTP response was received. This verifies URL reachability only.", 90 if r.status_code < 400 else 35, details)]
     except requests.RequestException as exc:
-        return [Finding("Web page", "possible", "URL could not be reached", value, f"Network error: {type(exc).__name__}", 15)]
+        return [Finding("Web page", "info", "URL could not be reached", value, f"Network error: {type(exc).__name__}. No finding was created.", 0)]
 
 
 def search_domain(domain: str) -> list[Finding]:
     info = domain_lookup(domain)
     found = any(info.values())
-    return [Finding("DNS", "verified" if found else "possible", "Public DNS lookup", "", "At least one DNS record resolved." if found else "No DNS records resolved.", 95 if found else 20, info)]
+    return [Finding("DNS", "verified" if found else "info", "Public DNS lookup", "", "At least one DNS record resolved." if found else "No DNS records resolved; this is not a finding.", 95 if found else 0, info)]
 
 
-def perform_item(value: str, requested_type: str, progress: Callable[[str], None] | None = None) -> dict[str, Any]:
+def perform_item(value: str, requested_type: str, progress: Callable[[str], None] | None = None, authorized: bool = False) -> dict[str, Any]:
     kind = infer_type(value) if requested_type == "auto" else requested_type
     query_value = value
     if kind == "username":
@@ -643,7 +688,14 @@ def perform_item(value: str, requested_type: str, progress: Callable[[str], None
         query_value = normalize_phone(value)
         findings = [Finding("Phone search", "info", "No reliable free direct lookup is enabled", "", "Phone-number identity lookup cannot be verified reliably from free public endpoints. No search-engine links are shown as results.", 0)]
     elif kind in {"name", "thailand"}:
-        findings = [Finding("Name search", "info", "No reliable free direct lookup is enabled", "", "A name alone is too ambiguous for automatic verification. No search-engine links are shown as results. Use known usernames for real account checks.", 0)]
+        findings = [Finding("Thai evidence mode", "info", "Exact-name discovery is manual and never auto-confirmed", "", "The system does not fuzzy-correct names or treat search snippets as evidence. Thai-local sources are separated from foreign/expat sources and ranked by source quality.", 0, {"variants": thai_variants(value), "thai_sources": THAI_SOURCE_CATALOG})]
+    elif kind == "self_audit":
+        if not authorized:
+            raise ValueError("Confirm that you own this profile or have explicit authorization before using self-exposure audit.")
+        if not value.startswith(("http://", "https://")):
+            raise ValueError("Self-exposure audit accepts a public profile URL you own or are authorized to review.")
+        findings = search_url(value)
+        findings.append(Finding("Consent boundary", "info", "Self-exposure audit only", "", "Use this mode only for your own public profile or with explicit authorization. The application does not log in, bypass access controls, or enumerate hidden profiles.", 0))
     else:
         raise ValueError(f"Unsupported search type: {kind}")
 
@@ -670,15 +722,15 @@ def cleanup_jobs() -> None:
                 _jobs.pop(job_id, None)
 
 
-def run_job(job_id: str, values: list[str], requested_type: str) -> None:
+def run_job(job_id: str, values: list[str], requested_type: str, authorized: bool = False) -> None:
     try:
         items: list[dict[str, Any]] = []
         total = len(values)
         for idx, value in enumerate(values, 1):
-            update_job(job_id, status="running", progress=round((idx - 1) / total * 100), message=f"Processing {idx}/{total}: {value}")
+            update_job(job_id, status="running", progress=round((idx - 1) / total * 100), message=f"Processing item {idx}/{total}")
             def progress(message: str) -> None:
                 update_job(job_id, message=message)
-            items.append(perform_item(value, requested_type, progress))
+            items.append(perform_item(value, requested_type, progress, authorized=authorized))
         result = {"version": VERSION, "items": items, "disclaimer": "Public-source evidence only. Account existence and real-world identity are separate questions."}
         update_job(job_id, status="complete", progress=100, message="Complete", result=result)
     except ValueError as exc:
@@ -693,21 +745,21 @@ HTML = r'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name
 :root{--bg:#06110e;--panel:#091713;--line:#21d8a6;--text:#ddfff6;--muted:#7fa99d;--red:#ff6969;--yellow:#f7c967;--blue:#83b8ff;--violet:#c19cff}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:ui-monospace,SFMono-Regular,Menlo,monospace}main{max-width:1050px;margin:auto;padding:22px}.brand{letter-spacing:.22em;color:var(--line);font-size:22px}.sub{color:var(--muted);line-height:1.5;margin:10px 0 22px}.panel{border:1px solid #17614f;background:var(--panel);padding:17px;margin:15px 0}select,textarea,button{width:100%;padding:14px;border:1px solid #2a715e;background:#06110e;color:var(--text);font:inherit}textarea{min-height:125px;resize:vertical}button{border-color:#b74242;color:#ff9999;margin-top:10px}.status{border-left:4px solid var(--line);padding:12px;margin-top:12px}.error{border-color:var(--red);color:#ffc0c0}.bar{height:8px;background:#15352d;margin-top:8px}.bar>div{height:100%;background:var(--line);width:0}.item{border:1px solid #1d604f;padding:14px;margin:15px 0}.summary{color:var(--muted);margin-bottom:12px}.card{border:1px solid #285f52;padding:12px;margin:9px 0;overflow-wrap:anywhere}.verified{border-color:var(--line)}.strong_possible{border-color:var(--violet)}.possible{border-color:var(--yellow)}.manual{border-color:var(--blue)}.info{border-color:#7ea89c}.badge{display:inline-block;padding:3px 7px;margin-right:8px;border:1px solid currentColor}.verified .badge{color:var(--line)}.strong_possible .badge{color:var(--violet)}.possible .badge{color:var(--yellow)}.manual .badge{color:var(--blue)}.info .badge{color:#aacbc1}a{color:#5ce6bf}.small{color:var(--muted);font-size:12px;line-height:1.45}.score{float:right}.privacy{font-size:12px;color:var(--muted);margin-top:8px}.actions{display:flex;gap:10px}.actions button{width:auto;flex:1}@media(max-width:650px){.brand{font-size:18px}.actions{display:block}}
 </style></head><body><main>
-<div class="brand">SOCIOSENTIAL EVIDENCE GRAPH</div>
-<div class="sub">Multi-engine public-source discovery: direct APIs, Sherlock, WhatsMyName, strict page verification, and limited second-hop pivots. Search links never count as findings.</div>
-<div class="panel"><select id="type"><option value="auto">Auto detect</option><option value="username">Username</option><option value="email">Email</option><option value="name">Full name</option><option value="phone">Phone</option><option value="domain">Domain</option><option value="url">URL</option><option value="thailand">Thailand public sources</option></select>
-<textarea id="query" placeholder="Up to 15 values. Separate with a new line, comma, semicolon, or *"></textarea><button id="go">SEARCH</button>
-<div class="privacy">No search history is intentionally persisted by the application. Public sources only. Verified means an exact account exists on that service—not proof that multiple accounts belong to the same person.</div><div id="status"></div></div><div id="results"></div>
+<div class="brand">SOCIOSENTIAL STRICT EVIDENCE 7</div>
+<div class="sub">Evidence-first public-source audit. Discovery engines only propose leads; publication requires independent verification. Thai-local sources are separated and ranked. Exact search links never count as findings.</div>
+<div class="panel"><select id="type"><option value="auto">Auto detect</option><option value="username">Username</option><option value="email">Email</option><option value="name">Full name</option><option value="phone">Phone</option><option value="domain">Domain</option><option value="url">URL</option><option value="thailand">Thailand public sources</option><option value="self_audit">Self-exposure audit (authorized URL)</option></select>
+<textarea id="query" placeholder="Up to 15 values. Separate with a new line, comma, semicolon, or *"></textarea><label class="privacy"><input id="authorized" type="checkbox" style="width:auto"> I confirm that self-audit URLs belong to me or I have explicit authorization.</label><button id="go">SEARCH</button>
+<div class="privacy">Jobs expire quickly and responses are not cached by the browser. Public sources only. Verified means exact account existence—not proof of real-world identity. Sensitive-profile review is limited to self-audit or explicit authorization.</div><div id="status"></div></div><div id="results"></div>
 <script>
 const $=s=>document.querySelector(s);const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));let lastData=null;
 function card(r,level){return `<div class="card ${level}"><span class="badge">${level.replace('_',' ').toUpperCase()}</span><b>${esc(r.source)} — ${esc(r.title)}</b>${r.score!=null?`<span class="score">${esc(r.score)}%</span>`:''}${r.url?`<div><a target="_blank" rel="noopener noreferrer" href="${esc(r.url)}">Open</a></div>`:''}${r.evidence?`<div class="small">${esc(r.evidence)}</div>`:''}${r.details?`<pre class="small">${esc(JSON.stringify(r.details,null,2))}</pre>`:''}</div>`}
 function section(title,arr,level){return arr?.length?`<h4>${title}</h4>${arr.map(r=>card(r,level)).join('')}`:''}
-function render(data){lastData=data;let h=`<div class="panel"><b>Version:</b> ${esc(data.version)} · <b>Items:</b> ${data.items.length}<div class="small">${esc(data.disclaimer||'')}</div><div class="actions"><button onclick="downloadJSON()">EXPORT JSON</button><button onclick="downloadCSV()">EXPORT CSV</button></div></div>`;for(const x of data.items){h+=`<div class="item"><h3>${esc(x.query)} <span class="small">(${esc(x.type)})</span></h3><div class="summary">Verified: ${x.counts.verified||0} · Strong possible: ${x.counts.strong_possible||0} · Possible: ${x.counts.possible||0} · Manual: ${x.counts.manual||0}</div>`;h+=section('Verified account existence',x.verified,'verified');h+=section('Cross-source information',x.info,'info');h+=section('Strong possible leads',x.strong_possible,'strong_possible');h+=section('Possible leads',x.possible,'possible');h+=`<details><summary>Manual public-source pivots (${x.manual.length})</summary>${x.manual.map(r=>card(r,'manual')).join('')}</details></div>`}$('#results').innerHTML=h}
+function render(data){lastData=data;let h=`<div class="panel"><b>Version:</b> ${esc(data.version)} · <b>Items:</b> ${data.items.length}<div class="small">${esc(data.disclaimer||'')}</div><div class="actions"><button onclick="downloadJSON()">EXPORT JSON</button><button onclick="downloadCSV()">EXPORT CSV</button></div></div>`;for(const x of data.items){h+=`<div class="item"><h3>${esc(x.query)} <span class="small">(${esc(x.type)})</span></h3><div class="summary">Verified existence: ${x.counts.verified||0} · Strict candidates: ${x.counts.strong_possible||0} · Weak shown: ${x.counts.possible||0} · Manual: ${x.counts.manual||0}</div>`;h+=section('Verified account existence',x.verified,'verified');h+=section('Cross-source information',x.info,'info');h+=section('Strong possible leads',x.strong_possible,'strong_possible');h+=section('Possible leads',x.possible,'possible');h+=`<details><summary>Manual public-source pivots (${x.manual.length})</summary>${x.manual.map(r=>card(r,'manual')).join('')}</details></div>`}$('#results').innerHTML=h}
 function download(name,text,type){const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([text],{type}));a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)}
 function downloadJSON(){if(lastData)download('sociosential-results.json',JSON.stringify(lastData,null,2),'application/json')}
 function downloadCSV(){if(!lastData)return;const rows=[['query','type','level','source','title','url','score','evidence']];for(const x of lastData.items){for(const level of ['verified','info','strong_possible','possible','manual'])for(const r of x[level]||[])rows.push([x.query,x.type,level,r.source||'',r.title||'',r.url||'',r.score??'',r.evidence||''])}const csv=rows.map(row=>row.map(v=>'"'+String(v).replaceAll('"','""')+'"').join(',')).join('\n');download('sociosential-results.csv',csv,'text/csv')}
 async function poll(id){for(let i=0;i<240;i++){const r=await fetch('/api/jobs/'+id);const d=await r.json();if(!r.ok)throw new Error(d.error||'Job failed');$('#status').innerHTML=`<div class="status">${esc(d.message||d.status)}<div class="bar"><div style="width:${d.progress||0}%"></div></div></div>`;if(d.status==='complete'){render(d.result);$('#status').innerHTML='<div class="status">Complete.</div>';return}if(d.status==='error')throw new Error(d.error||'Search failed');await new Promise(x=>setTimeout(x,1000))}throw new Error('Search took too long. Try fewer values.')}
-$('#go').onclick=async()=>{const query=$('#query').value.trim();if(!query)return;$('#go').disabled=true;$('#status').innerHTML='<div class="status">Starting…</div>';$('#results').innerHTML='';try{const r=await fetch('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query,type:$('#type').value})});const d=await r.json();if(!r.ok)throw new Error(d.error||'Could not start search');await poll(d.job_id)}catch(e){$('#status').innerHTML=`<div class="status error">${esc(e.message)}</div>`}finally{$('#go').disabled=false}};
+$('#go').onclick=async()=>{const query=$('#query').value.trim();if(!query)return;$('#go').disabled=true;$('#status').innerHTML='<div class="status">Starting…</div>';$('#results').innerHTML='';try{const r=await fetch('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query,type:$('#type').value,authorized:$('#authorized').checked})});const d=await r.json();if(!r.ok)throw new Error(d.error||'Could not start search');await poll(d.job_id)}catch(e){$('#status').innerHTML=`<div class="status error">${esc(e.message)}</div>`}finally{$('#go').disabled=false}};
 </script></main></body></html>'''
 
 
@@ -729,7 +781,7 @@ def index() -> str:
 
 @app.get("/health")
 def health() -> Response:
-    return jsonify({"status": "ok", "version": VERSION, "sherlock_enabled": os.getenv("ENABLE_SHERLOCK", "1") == "1", "whatsmyname_enabled": True, "mode": "evidence-graph"})
+    return jsonify({"status": "ok", "version": VERSION, "sherlock_enabled": os.getenv("ENABLE_SHERLOCK", "1") == "1", "whatsmyname_enabled": True, "mode": "strict-evidence-v7", "weak_candidates_suppressed": True})
 
 
 @app.post("/api/jobs")
@@ -740,7 +792,8 @@ def create_job() -> Response:
     payload = request.get_json(silent=True) or {}
     raw = str(payload.get("query", ""))[:5000]
     requested_type = str(payload.get("type", "auto")).lower()
-    if requested_type not in {"auto", "username", "email", "name", "phone", "domain", "url", "thailand"}:
+    authorized = bool(payload.get("authorized", False))
+    if requested_type not in {"auto", "username", "email", "name", "phone", "domain", "url", "thailand", "self_audit"}:
         return jsonify({"error": "Unsupported search type."}), 400
     try:
         values = split_items(raw)
@@ -749,7 +802,7 @@ def create_job() -> Response:
     job_id = uuid.uuid4().hex
     with _jobs_lock:
         _jobs[job_id] = {"status": "queued", "progress": 0, "message": "Queued", "created_at": time.time(), "updated_at": time.time()}
-    threading.Thread(target=run_job, args=(job_id, values, requested_type), daemon=True).start()
+    threading.Thread(target=run_job, args=(job_id, values, requested_type, authorized), daemon=True).start()
     return jsonify({"job_id": job_id, "status": "queued"}), 202
 
 
@@ -771,9 +824,10 @@ def api_search_compat() -> Response:
     payload = request.get_json(silent=True) or {}
     raw = str(payload.get("query", ""))[:5000]
     requested_type = str(payload.get("type", "auto")).lower()
+    authorized = bool(payload.get("authorized", False))
     try:
         values = split_items(raw)
-        items = [perform_item(v, requested_type) for v in values]
+        items = [perform_item(v, requested_type, authorized=authorized) for v in values]
         return jsonify({"version": VERSION, "items": items, "disclaimer": "Public-source evidence only."})
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400

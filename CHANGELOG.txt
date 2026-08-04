@@ -1,0 +1,12 @@
+SocioSential 7.0 changes
+
+- Discovery engines are treated as lead generators only.
+- A candidate page now needs an exact account path plus at least two independent page signals.
+- Weak and blocked candidates are suppressed instead of displayed as findings.
+- Thai-local sources are separated from global/foreign sources and include source-quality metadata.
+- Exact-phrase search links are manual pivots only and never counted as evidence.
+- Search corrections, translations, and broadened queries must be rejected during manual review.
+- URL/DNS failures are informational, not possible matches.
+- Self-exposure audit requires an explicit authorization checkbox and backend validation.
+- Search progress no longer displays the sensitive query value.
+- Jobs expire from memory after a short period.
